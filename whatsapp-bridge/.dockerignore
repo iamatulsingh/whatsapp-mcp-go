@@ -1,0 +1,7 @@
+.idea
+.vscode
+manifests
+Dockerfile
+README.md
+Makefile
+store

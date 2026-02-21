@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  wa:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wa
+    restart: always
+    environment:
+      IS_POSTGRES: "true"
+      POSTGRES_USER: "test"
+      POSTGRES_PASS: "test"
+      POSTGRES_HOST: "192.168.1.100"
+      POSTGRES_PORT: "5432"
+    ports:
+      - "8080:8080"
+    volumes:
+      - media:/project/store
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: "128M"
+        reservations:
+          cpus: "0.5"
+          memory: "64M"
+
+volumes:
+  media:
