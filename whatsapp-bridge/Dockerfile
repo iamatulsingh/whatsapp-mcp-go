@@ -17,14 +17,14 @@ RUN go mod download
 COPY . .
 
 # Build
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GO111MODULE=on go build -a -o whatsapp_backup main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GO111MODULE=on go build -a -o whatsapp_mcp_go main.go
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
 FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /project
-COPY --from=builder /project/whatsapp_backup .
+COPY --from=builder /project/whatsapp_mcp_go .
 
 USER 65532:65532
 
-ENTRYPOINT ["/project/whatsapp_backup"]
+ENTRYPOINT ["/project/whatsapp_mcp_go"]
