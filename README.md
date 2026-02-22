@@ -22,8 +22,8 @@ Start `whatsapp-bridge` -> then run `whatsapp-mcp-server` in your preferred mode
 1. **Clone this repository**
 
    ```bash
-   git clone https://github.com/iamatulsingh/whatsapp-mcp.git
-   cd whatsapp-mcp
+   git clone https://github.com/iamatulsingh/whatsapp-mcp-go.git
+   cd whatsapp-mcp-go
    ```
 
 2. **Run the WhatsApp bridge**
