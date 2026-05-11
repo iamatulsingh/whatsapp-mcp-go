@@ -49,7 +49,7 @@ Start `whatsapp-bridge` -> then run `whatsapp-mcp-server` in your preferred mode
                "whatsapp-mcp": {
                   "command": "{{PROJECT_BASE_PATH}}/whatsapp-mcp-server/whatsapp-mcp",
                   "env": {
-                       "WHATSAPP_API_SECRET": "c3VwZXItbG9uZy1yYW5kb20tc3RyaW5nLW1pbmltdW0tb2YtNjQtY2hhcmFjdGVycy15b3UtbmVlZC10by1wYXN0ZS1oZXJl"
+                       "WHATSAPP_API_KEY": "c3VwZXItbG9uZy1yYW5kb20tc3RyaW5nLW1pbmltdW0tb2YtNjQtY2hhcmFjdGVycy15b3UtbmVlZC10by1wYXN0ZS1oZXJl"
                   }
                }
            },
@@ -90,36 +90,76 @@ If you're running this project on Windows, be aware that `go-sqlite3` requires *
    go run main.go # or use this to enabled webhook and http streaming, `WEBHOOK_URL=http://192.168.178.119:5777/sse IS_HTTP=true go run main.go`
    ```
 
-OR
+### Or run everything in Docker
 
-Simply use dokcer compose to do all the job for you
+The repo ships a `docker-compose.yaml` at the root that brings up three
+services: `postgres`, `wa-bridge`, and `wa-mcp`. The MCP server is
+started in **HTTP mode** (port 5777) because that is the only mode that
+fits a long-running container — see "MCP server: stdio vs HTTP" below
+for when to use each.
+
 ```bash
+# 1. Set the four required vars (in .env at repo root, or in your shell)
+cat > .env <<EOF
+WHATSAPP_API_KEY=$(openssl rand -base64 48)
+WHATSAPP_JWT_SECRET=$(openssl rand -base64 48)
+POSTGRES_USER=whatsapp
+POSTGRES_PASS=$(openssl rand -base64 24)
+EOF
+
+# 2. Bring it all up
 docker compose up
 ```
 
+Once running:
+- Bridge REST API: `http://localhost:8080/api/...` (after `/auth/login`)
+- MCP HTTP endpoint: `http://localhost:5777`
+
+### MCP server: stdio vs HTTP
+
+The MCP server has two run modes selected by `IS_HTTP`:
+
+| Mode | When to use | How to launch |
+| --- | --- | --- |
+| **stdio** (`IS_HTTP=false`, default) | Claude Desktop, Cursor, or any host that spawns the MCP server as a child process | `go build` a local binary; reference it from `claude_desktop_config.json` / `mcp.json` (see below) |
+| **HTTP** (`IS_HTTP=true`) | n8n, web automation, or any client connecting over the network | `docker compose up` — the `wa-mcp` service runs in HTTP mode by default, listening on `:5777` |
+
+Stdio mode is **not** appropriate for the Docker image — Claude Desktop
+does not natively `docker run` to spawn an MCP child. Build a local
+binary instead.
+
 ## Authentication
 
-The HTTP API uses a two-step **API key → JWT** flow. The `API_KEY` you set in
-`docker-compose.yaml` is exchanged for a short-lived JWT, which is then used
-on every subsequent request to `/api/*`.
+The HTTP API is protected by a two-step **API key → JWT** flow.
 
-### 1. Exchange the API key for a JWT
+1. Send your static API key to `/auth/login` once. The bridge returns a 45-minute JWT.
+2. Use the JWT as `Authorization: Bearer <jwt>` on every `/api/...` call.
 
-```bash
-curl -X POST http://localhost:8080/auth/login \
-  -H "Authorization: Bearer <your-api-key>"
-# => {"token":"<jwt>"}
-```
-
-### 2. Call protected endpoints with the JWT
+### Step 1: Get a JWT
 
 ```bash
-curl -H "Authorization: Bearer <jwt>" \
-  http://localhost:8080/api/messages
+curl -X POST \
+  -H "Authorization: Bearer $WHATSAPP_API_KEY" \
+  http://localhost:8080/auth/login
+# {"token":"eyJhbGciOiJIUzI1NiIs..."}
 ```
 
-The MCP server handles this exchange automatically — you only need to set the
-`WHATSAPP_API_SECRET` environment variable to match the bridge's `API_KEY`.
+### Step 2: Call the API
+
+```bash
+TOKEN=eyJhbGciOiJIUzI1NiIs...
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/chats
+```
+
+The MCP server does this automatically: configure `WHATSAPP_API_KEY` and it
+fetches/refreshes JWTs as needed.
+
+### Rate limiting
+
+`/auth/login` is rate-limited per client IP (default: 5 attempts / minute).
+Override with `AUTH_LOGIN_RATE=<count>/<window>` (e.g. `10/30s`). Behind a
+reverse proxy, terminate rate limiting upstream — the bridge currently uses
+`r.RemoteAddr` and does not consult `X-Forwarded-For`.
 
 ## Architecture Overview
 
@@ -151,6 +191,8 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
+- **get_login_status**: Check whether the bridge is connected and logged in to WhatsApp. Returns `{connected, logged_in, pairing_required}`.
+- **get_pairing_qr**: Fetch the WhatsApp pairing QR as a PNG image. Returns image content when pairing is required, or a text message when the bridge is already logged in. Useful for completing the initial device-link flow from inside an MCP-aware UI instead of from the terminal.
 
 ### Media Handling Features
 

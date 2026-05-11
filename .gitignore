@@ -1,0 +1,34 @@
+# Project artifacts
+whatsapp-bridge/store/
+whatsapp-bridge/whatsapp-bridge
+whatsapp-mcp-server/whatsapp-mcp
+whatsapp-mcp-server/whatsapp-mcp-server
+
+# Go build / test output
+*.exe
+*.test
+*.out
+coverage.txt
+
+# Local config / secrets
+.env
+.env.*
+!.env.example
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

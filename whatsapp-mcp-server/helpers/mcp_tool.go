@@ -82,6 +82,16 @@ func InitMcpTool() {
 		Description: "Download media from a WhatsApp message and return local file path.",
 	}, downloadMediaHandler)
 
+	mcp.AddTool[getLoginStatusInput, any](server, &mcp.Tool{
+		Name:        "get_login_status",
+		Description: "Check whether the WhatsApp bridge is connected and logged in. Returns {connected, logged_in, pairing_required}.",
+	}, getLoginStatusHandler)
+
+	mcp.AddTool[getPairingQrInput, any](server, &mcp.Tool{
+		Name:        "get_pairing_qr",
+		Description: "Fetch the WhatsApp pairing QR as a PNG image. Returns image content when pairing is required; returns a text message when the bridge is already logged in or pairing has not started.",
+	}, getPairingQrHandler)
+
 	isHttp := strings.ToLower(ReadEnv("IS_HTTP", "false")) == "true" ||
 		strings.ToLower(ReadEnv("IS_HTTP", "0")) == "1"
 
@@ -174,6 +184,10 @@ type downloadMediaInput struct {
 	MessageID string `json:"message_id"`
 	ChatJid   string `json:"chat_jid"`
 }
+
+type getLoginStatusInput struct{}
+
+type getPairingQrInput struct{}
 
 func callAPI(method, path string, body any) ([]byte, error) {
 	token, err := GetOrRefreshJwtToken()
@@ -555,4 +569,56 @@ func sendAudioMessageHandler(ctx context.Context,
 	resultData := map[string]any{"success": success, "message": msg}
 
 	return &mcp.CallToolResult{IsError: !success}, resultData, nil
+}
+
+func getLoginStatusHandler(
+	ctx context.Context,
+	req *mcp.CallToolRequest,
+	_ getLoginStatusInput,
+) (*mcp.CallToolResult, any, error) {
+	data, err := callAPI(http.MethodGet, "/auth/status", nil)
+	if err != nil {
+		return ErrResult(fmt.Sprintf("failed to fetch login status: %v", err)), nil, nil
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: string(data)}},
+	}, nil, nil
+}
+
+func getPairingQrHandler(
+	ctx context.Context,
+	req *mcp.CallToolRequest,
+	_ getPairingQrInput,
+) (*mcp.CallToolResult, any, error) {
+	token, err := GetOrRefreshJwtToken()
+	if err != nil {
+		return ErrResult(fmt.Sprintf("authentication failed: %v", err)), nil, nil
+	}
+	httpReq, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/auth/pairing-qr", apiBaseURL), nil)
+	if err != nil {
+		return ErrResult(fmt.Sprintf("failed to build request: %v", err)), nil, nil
+	}
+	httpReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+
+	client := &http.Client{Timeout: apiTimeout}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return ErrResult(fmt.Sprintf("request failed: %v", err)), nil, nil
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.ImageContent{Data: body, MIMEType: "image/png"}},
+		}, nil, nil
+	case http.StatusGone:
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "No pairing QR available. The bridge is either already logged in or has not started the pairing flow yet."}},
+		}, nil, nil
+	default:
+		return ErrResult(fmt.Sprintf("unexpected status %d: %s", resp.StatusCode, string(body))), nil, nil
+	}
 }

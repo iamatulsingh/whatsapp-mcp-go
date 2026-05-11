@@ -1,9 +1,11 @@
 package auth
 
 import (
+	"crypto/subtle"
 	"encoding/json"
-	"fmt"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"whatsapp-bridge/config"
@@ -17,11 +19,31 @@ type Claims struct {
 }
 
 func LoginHandler(cfg *config.Config) http.HandlerFunc {
+	limiter, err := newLoginLimiter(cfg.AuthLoginRate)
+	if err != nil {
+		// Surface fatal config error at startup by returning a handler that always 500s.
+		// In practice main() should call newLoginLimiter directly and exit, but keeping
+		// the existing LoginHandler signature stable avoids a wider refactor in this PR.
+		slog.Error("invalid AUTH_LOGIN_RATE", "err", err)
+		return func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "server misconfigured", http.StatusInternalServerError)
+		}
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
+		ip := clientIP(r)
+		lim := limiter.get(ip)
+		if !lim.Allow() {
+			retry := retryAfterSeconds(lim)
+			w.Header().Set("Retry-After", strconv.Itoa(retry))
+			slog.Warn("login rate-limited", "remote", ip)
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return
+		}
+		expected := []byte("Bearer " + cfg.APIKey)
+		got := []byte(r.Header.Get("Authorization"))
 
-		if auth != fmt.Sprintf("Bearer %s", cfg.APIKey) {
-			fmt.Println("Invalid API key")
+		if subtle.ConstantTimeCompare(expected, got) != 1 {
+			slog.Warn("login rejected: bad api key", "remote", r.RemoteAddr)
 			http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 			return
 		}
@@ -29,6 +51,8 @@ func LoginHandler(cfg *config.Config) http.HandlerFunc {
 		claims := Claims{
 			Service: "mcp-server",
 			RegisteredClaims: jwt.RegisteredClaims{
+				Issuer:    "whatsapp-bridge",
+				Audience:  []string{"whatsapp-mcp-server"},
 				ExpiresAt: jwt.NewNumericDate(time.Now().Add(45 * time.Minute)),
 				IssuedAt:  jwt.NewNumericDate(time.Now()),
 			},
@@ -37,7 +61,7 @@ func LoginHandler(cfg *config.Config) http.HandlerFunc {
 		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 		signed, err := token.SignedString(cfg.JWTSecret)
 		if err != nil {
-			fmt.Println("Failed to sign token:", err)
+			slog.Error("failed to sign token", "err", err)
 			http.Error(w, "Failed to generate token", http.StatusInternalServerError)
 			return
 		}
@@ -57,18 +81,25 @@ func JwtAuthMiddleware(cfg *config.Config, next http.Handler) http.Handler {
 
 		tokenStr := strings.TrimPrefix(auth, "Bearer ")
 
-		token, err := jwt.ParseWithClaims(tokenStr, &Claims{}, func(token *jwt.Token) (interface{}, error) {
-			return cfg.JWTSecret, nil
-		})
+		token, err := jwt.ParseWithClaims(
+			tokenStr,
+			&Claims{},
+			func(token *jwt.Token) (interface{}, error) {
+				return cfg.JWTSecret, nil
+			},
+			jwt.WithIssuer("whatsapp-bridge"),
+			jwt.WithAudience("whatsapp-mcp-server"),
+			jwt.WithValidMethods([]string{"HS256"}),
+		)
 
 		if err != nil {
-			fmt.Println("Parse error:", err)
+			slog.Warn("jwt parse error", "err", err, "remote", r.RemoteAddr)
 			http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
 			return
 		}
 
 		if !token.Valid {
-			fmt.Println("Token is NOT valid")
+			slog.Warn("jwt invalid", "remote", r.RemoteAddr)
 			http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
 			return
 		}

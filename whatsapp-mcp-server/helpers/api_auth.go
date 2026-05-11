@@ -14,11 +14,24 @@ import (
 )
 
 var (
-	apiSecret      = ReadEnv("WHATSAPP_API_SECRET", "")
+	apiKey         = readApiKeyEnv()
 	jwtToken       string
 	tokenMutex     sync.Mutex
 	tokenExpiresAt time.Time
 )
+
+func readApiKeyEnv() string {
+	if v := ReadEnv("WHATSAPP_API_KEY", ""); v != "" {
+		return v
+	}
+	if v := ReadEnv("WHATSAPP_API_SECRET", ""); v != "" {
+		slog.Warn("env var is deprecated, use the new name",
+			"deprecated", "WHATSAPP_API_SECRET",
+			"use_instead", "WHATSAPP_API_KEY")
+		return v
+	}
+	return ""
+}
 
 // GetOrRefreshJwtToken returns a valid JWT or fetches a new one
 func GetOrRefreshJwtToken() (string, error) {
@@ -35,7 +48,7 @@ func GetOrRefreshJwtToken() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiSecret))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)

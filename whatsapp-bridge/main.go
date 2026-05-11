@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"math"
 	"math/rand"
 	"net/http"
@@ -18,10 +19,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"whatsapp-bridge/auth"
 	"whatsapp-bridge/config"
+	bridgelogger "whatsapp-bridge/logger"
+	"whatsapp-bridge/wastate"
 
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/socket"
@@ -29,6 +33,7 @@ import (
 	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
+	qrcode "github.com/skip2/go-qrcode"
 
 	"bytes"
 
@@ -441,7 +446,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
 
-		fmt.Println("Media uploaded", resp)
+		slog.Info("media uploaded", "response", resp)
 
 		switch mediaType {
 		case whatsmeow.MediaImage:
@@ -468,7 +473,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
 				}
 			} else {
-				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
+				slog.Warn("not an Ogg Opus file", "mime_type", mimeType)
 			}
 
 			msg.AudioMessage = &waE2E.AudioMessage{
@@ -647,9 +652,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 
 		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			slog.Info("message", "ts", timestamp, "direction", direction, "sender", sender, "media_type", mediaType, "filename", filename, "content", content)
 		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			slog.Info("message", "ts", timestamp, "direction", direction, "sender", sender, "content", content)
 		}
 	}
 }
@@ -814,7 +819,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("incomplete media information for download")
 	}
 
-	fmt.Printf("Attempting to download media for message %s in chat %s...\n", messageID, chatJID)
+	slog.Info("attempting to download media", "message_id", messageID, "chat_jid", chatJID)
 
 	directPath := extractDirectPathFromURL(url)
 
@@ -851,7 +856,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
-	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
+	slog.Info("successfully downloaded media", "media_type", mediaType, "path", absPath, "bytes", len(mediaData))
 	return true, mediaType, filename, absPath, nil
 }
 
@@ -872,7 +877,7 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, cfg *config.Config) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *config.Config, state *wastate.State) {
 	apiMux := http.NewServeMux()
 
 	// Send message
@@ -898,10 +903,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+		slog.Info("received request to send message", "message", req.Message, "media_path", req.MediaPath)
 
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
+		slog.Info("message sent", "success", success, "message", message)
 		w.Header().Set("Content-Type", "application/json")
 
 		if !success {
@@ -1213,17 +1218,46 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	apiMux.HandleFunc("/auth/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{
+			"connected":        state.Connected(),
+			"logged_in":        state.LoggedIn(),
+			"pairing_required": state.PairingRequired(),
+			"wa_version":       state.WAVersion(),
+		})
+	})
+
+	apiMux.HandleFunc("/auth/pairing-qr", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		png := state.PairingQRPNG()
+		if png == nil {
+			http.Error(w, "no pairing QR available; client is logged in or has not started pairing yet", http.StatusGone)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(png)
+	})
+
 	// Authentication
 	protected := auth.JwtAuthMiddleware(cfg, apiMux)
 	http.Handle("/api/", http.StripPrefix("/api", protected))
 	http.Handle("/auth/login", auth.LoginHandler(cfg))
 
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	serverAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	slog.Info("starting REST API server", "addr", serverAddr)
 
 	go func() {
 		if err := http.ListenAndServe(serverAddr, nil); err != nil {
-			fmt.Printf("REST API server error: %v\n", err)
+			slog.Error("rest api server error", "err", err)
 		}
 	}()
 }
@@ -1308,7 +1342,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
-	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
+	slog.Info("received history sync event", "conversations", len(historySync.Data.Conversations))
 
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
@@ -1430,29 +1464,29 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		}
 	}
 
-	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+	slog.Info("history sync complete", "stored_messages", syncedCount)
 }
 
 // Request history sync from the server
 func requestHistorySync(client *whatsmeow.Client) {
 	if client == nil {
-		fmt.Println("Client is not initialized. Cannot request history sync.")
+		slog.Error("client is not initialized, cannot request history sync")
 		return
 	}
 
 	if !client.IsConnected() {
-		fmt.Println("Client is not connected. Please ensure you are connected to WhatsApp first.")
+		slog.Warn("client is not connected to whatsapp")
 		return
 	}
 
 	if client.Store.ID == nil {
-		fmt.Println("Client is not logged in. Please scan the QR code first.")
+		slog.Warn("client is not logged in, please scan the qr code")
 		return
 	}
 
 	historyMsg := client.BuildHistorySyncRequest(nil, 100)
 	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
+		slog.Error("failed to build history sync request")
 		return
 	}
 
@@ -1462,9 +1496,9 @@ func requestHistorySync(client *whatsmeow.Client) {
 	}, historyMsg)
 
 	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
+		slog.Error("failed to request history sync", "err", err)
 	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
+		slog.Info("history sync requested, waiting for server response")
 	}
 }
 
@@ -1515,7 +1549,7 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 					preSkip = binary.LittleEndian.Uint16(pageData[headPos+10 : headPos+12])
 					sampleRate = binary.LittleEndian.Uint32(pageData[headPos+12 : headPos+16])
 					foundOpusHead = true
-					fmt.Printf("Found OpusHead: sampleRate=%d, preSkip=%d\n", sampleRate, preSkip)
+					slog.Info("found OpusHead", "sample_rate", sampleRate, "pre_skip", preSkip)
 				}
 			}
 		}
@@ -1528,16 +1562,15 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 	}
 
 	if !foundOpusHead {
-		fmt.Println("Warning: OpusHead not found, using default values")
+		slog.Warn("opushead not found, using default values")
 	}
 
 	if lastGranule > 0 {
 		durationSeconds := float64(lastGranule-uint64(preSkip)) / float64(sampleRate)
 		duration = uint32(math.Ceil(durationSeconds))
-		fmt.Printf("Calculated Opus duration from granule: %f seconds (lastGranule=%d)\n",
-			durationSeconds, lastGranule)
+		slog.Info("calculated Opus duration from granule", "duration_seconds", durationSeconds, "last_granule", lastGranule)
 	} else {
-		fmt.Println("Warning: No valid granule position found, using estimation")
+		slog.Warn("no valid granule position found, using estimation")
 		durationEstimate := float64(len(data)) / 2000.0
 		duration = uint32(durationEstimate)
 	}
@@ -1550,8 +1583,7 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 
 	waveform = placeholderWaveform(duration)
 
-	fmt.Printf("Ogg Opus analysis: size=%d bytes, calculated duration=%d sec, waveform=%d bytes\n",
-		len(data), duration, len(waveform))
+	slog.Info("ogg opus analysis complete", "size_bytes", len(data), "duration_sec", duration, "waveform_bytes", len(waveform))
 
 	return duration, waveform, nil
 }
@@ -2381,8 +2413,11 @@ func main() {
 		return
 	}
 
+	slog.SetDefault(bridgelogger.New(os.Getenv("LOG_LEVEL")))
+
 	cfg, err := config.LoadConfig()
 	if err != nil {
+		logger.Errorf("Failed to load config: %v", err)
 		return
 	}
 
@@ -2412,11 +2447,14 @@ func main() {
 		}
 	}
 
+	state := wastate.New()
+
 	version, err := CustomGetLatestVersion(context.Background(), nil)
 	if err != nil {
 		logger.Errorf("Failed to retrieve current WhatsApp Web client Version")
 	} else {
 		store.SetWAVersion(*version)
+		state.SetWAVersion(fmt.Sprintf("%d.%d.%d", version[0], version[1], version[2]))
 		logger.Infof("WhatsApp Web Client Version: %d.%d.%d\n", version[0], version[1], version[2])
 	}
 	client := whatsmeow.NewClient(deviceStore, logger)
@@ -2435,6 +2473,12 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	state.SetLoggedIn(client.Store.ID != nil) // existing session means already logged in
+
+	const maxOutdatedRetries = 3
+	var outdatedRetries int
+	var outdatedRetriesMu sync.Mutex
+
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
@@ -2445,58 +2489,110 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			state.SetConnected(true)
+			state.SetLoggedIn(true)
+			state.ClearPairingQR()
+			outdatedRetriesMu.Lock()
+			outdatedRetries = 0
+			outdatedRetriesMu.Unlock()
+
+		case *events.Disconnected:
+			logger.Warnf("Disconnected from WhatsApp")
+			state.SetConnected(false)
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+			state.SetLoggedIn(false)
+			state.SetConnected(false)
+
+		case *events.ClientOutdated:
+			outdatedRetriesMu.Lock()
+			outdatedRetries++
+			n := outdatedRetries
+			outdatedRetriesMu.Unlock()
+			state.SetConnected(false)
+			if n > maxOutdatedRetries {
+				slog.Error("client outdated: exceeded retry budget; whatsmeow library likely needs a real upgrade",
+					"retries", n, "max", maxOutdatedRetries)
+				return
+			}
+			slog.Warn("client outdated (405); refreshing wa version and reconnecting",
+				"attempt", n, "max", maxOutdatedRetries)
+			go func() {
+				time.Sleep(5 * time.Second)
+				newVersion, err := CustomGetLatestVersion(context.Background(), nil)
+				if err != nil {
+					slog.Error("failed to refresh wa version", "err", err)
+					return
+				}
+				store.SetWAVersion(*newVersion)
+				state.SetWAVersion(fmt.Sprintf("%d.%d.%d", newVersion[0], newVersion[1], newVersion[2]))
+				slog.Info("applied refreshed wa version, attempting reconnect", "version", state.WAVersion())
+				if err := client.Connect(); err != nil {
+					slog.Error("reconnect after wa version refresh failed", "err", err)
+				}
+			}()
 		}
 	})
 
-	connected := make(chan bool, 1)
+	// REST server comes up first so /api/auth/status and /api/auth/pairing-qr
+	// are reachable during pairing. WhatsApp connect runs concurrently below.
+	startRESTServer(client, messageStore, cfg, state)
 
-	if client.Store.ID == nil {
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
+	// Periodically refresh the WhatsApp Web client version so reconnects
+	// after transient drops use a current version string. Only the next
+	// connection picks up the refreshed value; the active session is unaffected.
+	go func() {
+		t := time.NewTicker(6 * time.Hour)
+		defer t.Stop()
+		for range t.C {
+			v, err := CustomGetLatestVersion(context.Background(), nil)
+			if err != nil {
+				slog.Warn("periodic wa version refresh failed", "err", err)
+				continue
+			}
+			store.SetWAVersion(*v)
+			next := fmt.Sprintf("%d.%d.%d", v[0], v[1], v[2])
+			if next != state.WAVersion() {
+				slog.Info("wa version updated by periodic refresh", "from", state.WAVersion(), "to", next)
+				state.SetWAVersion(next)
 			}
 		}
+	}()
 
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
-			return
+	// Pair / connect to WhatsApp in a goroutine so main can block on signals.
+	go func() {
+		if client.Store.ID == nil {
+			qrChan, _ := client.GetQRChannel(context.Background())
+			if err := client.Connect(); err != nil {
+				logger.Errorf("Failed to connect: %v", err)
+				return
+			}
+			for evt := range qrChan {
+				switch evt.Event {
+				case "code":
+					fmt.Println("\nScan this QR code with your WhatsApp app:")
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+					if png, err := qrcode.Encode(evt.Code, qrcode.Medium, 256); err == nil {
+						state.SetPairingQRPNG(png)
+					} else {
+						slog.Warn("failed to encode pairing qr as png", "err", err)
+					}
+				case "success":
+					fmt.Println("\nSuccessfully connected and authenticated!")
+					return
+				case "timeout":
+					logger.Errorf("Pairing QR timeout")
+					return
+				}
+			}
+		} else {
+			if err := client.Connect(); err != nil {
+				logger.Errorf("Failed to connect: %v", err)
+				return
+			}
 		}
-	} else {
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-		connected <- true
-	}
-
-	time.Sleep(2 * time.Second)
-
-	if !client.IsConnected() {
-		logger.Errorf("Failed to establish stable connection")
-		return
-	}
-
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	startRESTServer(client, messageStore, 8080, cfg)
+	}()
 
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)

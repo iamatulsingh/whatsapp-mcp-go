@@ -2,13 +2,23 @@ package helpers
 
 import (
 	"encoding/json"
+	"log/slog"
 	"os"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-var apiBaseURL = ReadEnv("API_BASE_URL", "http://192.168.178.119:30015/api")
+var apiBaseURL = readApiBaseURL()
+
+func readApiBaseURL() string {
+	if v := ReadEnv("API_BASE_URL", "http://192.168.178.119:30015/api"); v != "" {
+		return v
+	}
+	const fallback = "http://localhost:8080/api"
+	slog.Warn("api_base_url not set, using default", "fallback", fallback)
+	return fallback
+}
 
 const apiTimeout = 25 * time.Second
 

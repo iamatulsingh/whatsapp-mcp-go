@@ -7,7 +7,9 @@ require (
 	github.com/lib/pq v1.11.2
 	github.com/mattn/go-sqlite3 v1.14.34
 	github.com/mdp/qrterminal v1.0.1
+	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	go.mau.fi/whatsmeow v0.0.0-20260305215846-fc65416c22c4
+	golang.org/x/time v0.15.0
 	google.golang.org/protobuf v1.36.11
 )
 

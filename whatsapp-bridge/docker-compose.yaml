@@ -1,26 +1,40 @@
 services:
-  wa:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: wa
+  postgres:
+    image: postgres:16
+    container_name: postgres
     restart: always
     environment:
+      POSTGRES_USER: "${POSTGRES_USER:?set POSTGRES_USER in environment or .env}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASS:?set POSTGRES_PASS in environment or .env}"
+      POSTGRES_DB: whatsapp
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  wa-bridge:
+    build:
+      context: ./whatsapp-bridge
+      dockerfile: Dockerfile
+    container_name: wa-bridge
+    restart: always
+    environment:
+      WHATSAPP_API_KEY: "${WHATSAPP_API_KEY:?set WHATSAPP_API_KEY in environment or .env}"
+      WHATSAPP_JWT_SECRET: "${WHATSAPP_JWT_SECRET:?set WHATSAPP_JWT_SECRET in environment or .env}"
       IS_POSTGRES: "true"
-      POSTGRES_USER: "test"
-      POSTGRES_PASS: "test"
-      POSTGRES_HOST: "postgres"
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASS: "${POSTGRES_PASS}"
+      POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
-      # Replace with two strong, independent random strings before bringing the stack up.
-      # Suggested: openssl rand -base64 64 | tr -d '\n=' | tr '/+' '_-' | head -c 64
-      API_KEY: "CHANGE_ME_TO_A_LONG_RANDOM_STRING_AT_LEAST_64_CHARS_______________"
-      JWT_SECRET: "CHANGE_ME_TO_A_DIFFERENT_LONG_RANDOM_STRING_AT_LEAST_64_CHARS____"
-      # Optional: set this to forward every inbound message to a webhook (e.g. n8n).
-      # WEBHOOK_URL: "http://your-host:5678/webhook/whatsapp"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      AUTH_LOGIN_RATE: "${AUTH_LOGIN_RATE:-}"
+      WEBHOOK_URL: "${WEBHOOK_URL:-}"
+      HOST: "${HOST:-}"
+      PORT: "${PORT:-8080}"
     ports:
       - "8080:8080"
     volumes:
-      - media:/project/store
+      - bridge-store:/project/store
     depends_on:
       - postgres
     deploy:
@@ -31,19 +45,32 @@ services:
         reservations:
           cpus: "0.5"
           memory: "64M"
-  postgres:
-    image: postgres:16
-    container_name: postgres
+
+  wa-mcp:
+    build:
+      context: ./whatsapp-mcp-server
+      dockerfile: Dockerfile
+    container_name: wa-mcp
     restart: always
     environment:
-      POSTGRES_USER: "test"
-      POSTGRES_PASSWORD: "test"
-      POSTGRES_DB: "whatsapp"
+      WHATSAPP_API_KEY: "${WHATSAPP_API_KEY:?set WHATSAPP_API_KEY in environment or .env}"
+      API_BASE_URL: "http://wa-bridge:8080/api"
+      IS_HTTP: "true"
+      HTTP_BASE_URL: "0.0.0.0:5777"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
     ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
+      - "5777:5777"
+    depends_on:
+      - wa-bridge
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "64M"
+        reservations:
+          cpus: "0.25"
+          memory: "32M"
 
 volumes:
-  media:
   pgdata:
+  bridge-store:
