@@ -128,6 +128,44 @@ func openDatabase(dbName string) (*sql.DB, error) {
 	return sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
 }
 
+// validateMediaPath sanitize media path
+func validateMediaPath(mediaPath string) (string, error) {
+	if mediaPath == "" {
+		return "", fmt.Errorf("empty media path")
+	}
+
+	// Allowed media directory
+	baseDir := "./media"
+
+	absBaseDir, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", err
+	}
+
+	// Reject absolute paths
+	if filepath.IsAbs(mediaPath) {
+		return "", fmt.Errorf("absolute paths are not allowed")
+	}
+
+	// Clean traversal sequences
+	cleanPath := filepath.Clean(mediaPath)
+
+	fullPath := filepath.Join(absBaseDir, cleanPath)
+
+	absPath, err := filepath.Abs(fullPath)
+	if err != nil {
+		return "", err
+	}
+
+	// Ensure resolved path stays inside media directory
+	if !strings.HasPrefix(absPath, absBaseDir+string(os.PathSeparator)) &&
+		absPath != absBaseDir {
+		return "", fmt.Errorf("path traversal detected")
+	}
+
+	return absPath, nil
+}
+
 // NewMessageStore Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	if err := os.MkdirAll("store", 0755); err != nil {
@@ -399,7 +437,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	msg := &waE2E.Message{}
 
 	if mediaPath != "" {
-		mediaData, err := os.ReadFile(mediaPath)
+		validatedPath, err := validateMediaPath(mediaPath)
+		if err != nil {
+			return false, fmt.Sprintf("Invalid media path: %v", err)
+		}
+		mediaData, err := os.ReadFile(validatedPath)
 		if err != nil {
 			return false, fmt.Sprintf("Error reading media file: %v", err)
 		}
