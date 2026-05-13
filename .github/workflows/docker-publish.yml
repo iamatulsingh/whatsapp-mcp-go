@@ -62,9 +62,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.context }}
-
           platforms: linux/amd64,linux/arm64
-
           push: true
 
           tags: ${{ steps.meta.outputs.tags }}
@@ -72,5 +70,4 @@ jobs:
 
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
-
           provenance: false
