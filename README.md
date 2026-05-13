@@ -9,6 +9,7 @@ Start `whatsapp-bridge` -> then run `whatsapp-mcp-server` in your preferred mode
 | Connector | Chat |
 |------------|----------|
 | ![Connector](./screenshots/connector_claude.png) | ![Chat](./screenshots/chat_example.png) |
+| ![n8n](./screenshots/n8n_demo.png.png) |  |
 
 ## Installation
 
