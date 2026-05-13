@@ -8,10 +8,6 @@ Start `whatsapp-bridge` -> then run `whatsapp-mcp-server` in your preferred mode
 
 <table>
   <tr>
-    <th>Connector</th>
-    <th>Chat</th>
-  </tr>
-  <tr>
     <td align="center">
       <img src="./screenshots/connector_claude.png" width="320" />
     </td>
