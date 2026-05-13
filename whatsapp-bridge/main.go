@@ -224,6 +224,231 @@ func (store *MessageStore) Close() error {
 	return store.db.Close()
 }
 
+// normalizeUserJID converts a LID JID (xxxx@lid) into a phone-number JID (xxxx@s.whatsapp.net)
+// using the whatsmeow LID mapping store. Non-LID JIDs are returned unchanged.
+func normalizeUserJID(client *whatsmeow.Client, jid types.JID) types.JID {
+	if client == nil || client.Store == nil || client.Store.LIDs == nil {
+		return jid
+	}
+
+	// Only normalize hidden-user server (@lid)
+	if jid.Server != types.HiddenUserServer {
+		return jid
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	pn, err := client.Store.LIDs.GetPNForLID(ctx, jid)
+	if err != nil || pn.IsEmpty() {
+		return jid
+	}
+
+	return pn
+}
+
+// migrateLIDChatsToPhoneJIDs merges chats stored under @lid
+// into their corresponding @s.whatsapp.net chats.
+//
+// This is idempotent and safe to run on every startup.
+//
+// Migration order:
+//
+// 1. Create/upsert PN chat
+// 2. Move messages to PN chat
+// 3. Delete leftover duplicate messages
+// 4. Delete old LID chat
+func migrateLIDChatsToPhoneJIDs(
+	client *whatsmeow.Client,
+	store *MessageStore,
+	logger waLog.Logger,
+	isPostgresDB bool,
+) {
+	if client == nil || store == nil || store.db == nil {
+		return
+	}
+
+	db := store.db
+
+	var query string
+	arg := "%@" + types.HiddenUserServer
+
+	if isPostgresDB {
+		query = `
+			SELECT jid, name, last_message_time
+			FROM chats
+			WHERE jid LIKE $1
+		`
+	} else {
+		query = `
+			SELECT jid, name, last_message_time
+			FROM chats
+			WHERE jid LIKE ?
+		`
+	}
+
+	rows, err := db.Query(query, arg)
+	if err != nil {
+		logger.Errorf("LID migration: failed listing chats: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	type lidChat struct {
+		JID             string
+		Name            string
+		LastMessageTime time.Time
+	}
+
+	var chats []lidChat
+
+	for rows.Next() {
+		var c lidChat
+
+		if err := rows.Scan(&c.JID, &c.Name, &c.LastMessageTime); err != nil {
+			logger.Warnf("LID migration: scan failed: %v", err)
+			continue
+		}
+
+		chats = append(chats, c)
+	}
+
+	if len(chats) == 0 {
+		return
+	}
+
+	logger.Infof("LID migration: found %d @lid chats", len(chats))
+
+	merged := 0
+	skipped := 0
+
+	for _, c := range chats {
+
+		tx, err := db.Begin()
+		if err != nil {
+			logger.Warnf("LID migration: tx begin failed for %s: %v", c.JID, err)
+			skipped++
+			continue
+		}
+
+		commit := false
+		defer func() {
+			if !commit {
+				_ = tx.Rollback()
+			}
+		}()
+
+		lidJID, parseErr := types.ParseJID(c.JID)
+		if parseErr != nil {
+			logger.Warnf("LID migration: invalid jid %s: %v", c.JID, parseErr)
+			_ = tx.Rollback()
+			skipped++
+			continue
+		}
+
+		pnJID := normalizeUserJID(client, lidJID)
+
+		if pnJID.Server != types.DefaultUserServer {
+			_ = tx.Rollback()
+			skipped++
+			continue
+		}
+
+		pnStr := pnJID.String()
+
+		var upsertQuery string
+
+		if isPostgresDB {
+			upsertQuery = `
+				INSERT INTO chats (jid, name, last_message_time)
+				VALUES ($1, $2, $3)
+				ON CONFLICT (jid)
+				DO UPDATE SET
+					name = COALESCE(NULLIF(chats.name, ''), EXCLUDED.name),
+					last_message_time = GREATEST(
+						chats.last_message_time,
+						EXCLUDED.last_message_time
+					)
+			`
+		} else {
+			upsertQuery = `
+				INSERT INTO chats (jid, name, last_message_time)
+				VALUES (?, ?, ?)
+				ON CONFLICT(jid)
+				DO UPDATE SET
+					name = COALESCE(NULLIF(chats.name, ''), excluded.name),
+					last_message_time = MAX(
+						chats.last_message_time,
+						excluded.last_message_time
+					)
+			`
+		}
+
+		if _, err = tx.Exec(upsertQuery, pnStr, c.Name, c.LastMessageTime); err != nil {
+			logger.Warnf("LID migration: upsert failed %s -> %s: %v", c.JID, pnStr, err)
+			_ = tx.Rollback()
+			skipped++
+			continue
+		}
+
+		var moveMessagesQuery string
+
+		if isPostgresDB {
+			moveMessagesQuery = `
+				UPDATE messages
+				SET chat_jid = $1
+				WHERE chat_jid = $2
+			`
+		} else {
+			moveMessagesQuery = `
+				UPDATE messages
+				SET chat_jid = ?
+				WHERE chat_jid = ?
+			`
+		}
+
+		if _, err = tx.Exec(moveMessagesQuery, pnStr, c.JID); err != nil {
+			logger.Warnf("LID migration: move messages failed %s -> %s: %v", c.JID, pnStr, err)
+			_ = tx.Rollback()
+			skipped++
+			continue
+		}
+
+		var deleteChatQuery string
+
+		if isPostgresDB {
+			deleteChatQuery = `DELETE FROM chats WHERE jid = $1`
+		} else {
+			deleteChatQuery = `DELETE FROM chats WHERE jid = ?`
+		}
+
+		if _, err = tx.Exec(deleteChatQuery, c.JID); err != nil {
+			logger.Warnf("LID migration: delete old chat failed %s: %v", c.JID, err)
+			_ = tx.Rollback()
+			skipped++
+			continue
+		}
+
+		if err = tx.Commit(); err != nil {
+			logger.Warnf("LID migration: commit failed %s: %v", c.JID, err)
+			_ = tx.Rollback()
+			skipped++
+			continue
+		}
+
+		commit = true
+
+		logger.Infof("LID migration: merged %s -> %s", c.JID, pnStr)
+		merged++
+	}
+
+	logger.Infof(
+		"LID migration complete: %d merged, %d skipped",
+		merged,
+		skipped,
+	)
+}
+
 // StoreChat Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	if isPostgres {
@@ -650,8 +875,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 		defer resp.Body.Close()
 	}()
-	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	chatJID := normalizeUserJID(client, msg.Info.Chat).String()
+	sender := normalizeUserJID(client, msg.Info.Sender).User
 
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
 
@@ -1399,6 +1624,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
 			continue
 		}
+		jid = normalizeUserJID(client, jid)
+		chatJID = jid.String()
 
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
 
@@ -1453,7 +1680,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 						isFromMe = *msg.Message.Key.FromMe
 					}
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
+						if pJid, err := types.ParseJID(*msg.Message.Key.Participant); err == nil {
+							sender = normalizeUserJID(client, pJid).User
+						} else {
+							sender = *msg.Message.Key.Participant
+						}
 					} else if isFromMe {
 						sender = client.Store.ID.User
 					} else {
@@ -2576,6 +2807,8 @@ func main() {
 			}()
 		}
 	})
+
+	migrateLIDChatsToPhoneJIDs(client, messageStore, logger, cfg.DB.IsPostgres)
 
 	// REST server comes up first so /api/auth/status and /api/auth/pairing-qr
 	// are reachable during pairing. WhatsApp connect runs concurrently below.
