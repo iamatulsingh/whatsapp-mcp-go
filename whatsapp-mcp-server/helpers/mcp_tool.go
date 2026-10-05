@@ -3,17 +3,47 @@ package helpers
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// bearerAuth rejects requests that don't carry "Authorization: Bearer <token>".
+func bearerAuth(token string, next http.Handler) http.Handler {
+	expected := []byte("Bearer " + token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), expected) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isLoopbackAddr reports whether a host:port listen address is loopback-only.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
 
 // InitMcpTool initializes MCP tool for the MCP server
 func InitMcpTool() {
@@ -62,20 +92,26 @@ func InitMcpTool() {
 		Description: "Get most recent WhatsApp message involving the contact.",
 	}, getLastInteractionHandler)
 
-	mcp.AddTool[sendMessageInput, map[string]any](server, &mcp.Tool{
-		Name:        "send_message",
-		Description: "Send a text message to a person or group on WhatsApp. For groups use the group JID.",
-	}, sendMessageHandler)
+	// READ_ONLY=true (the default) leaves the send tools out entirely, so the
+	// model never sees them. Set READ_ONLY=false to enable sending.
+	if IsReadOnly() {
+		slog.Info("READ_ONLY enabled: send_message, send_file and send_audio_message are not registered")
+	} else {
+		mcp.AddTool[sendMessageInput, map[string]any](server, &mcp.Tool{
+			Name:        "send_message",
+			Description: "Send a text message to a person or group on WhatsApp. For groups use the group JID.",
+		}, sendMessageHandler)
 
-	mcp.AddTool[sendFileInput, map[string]any](server, &mcp.Tool{
-		Name:        "send_file",
-		Description: "Send image, video, document or any file via WhatsApp.",
-	}, sendFileHandler)
+		mcp.AddTool[sendFileInput, map[string]any](server, &mcp.Tool{
+			Name:        "send_file",
+			Description: "Send image, video, document or any file via WhatsApp.",
+		}, sendFileHandler)
 
-	mcp.AddTool[sendAudioMessageInput, map[string]any](server, &mcp.Tool{
-		Name:        "send_audio_message",
-		Description: "Send audio/voice message (converted to Opus .ogg if needed).",
-	}, sendAudioMessageHandler)
+		mcp.AddTool[sendAudioMessageInput, map[string]any](server, &mcp.Tool{
+			Name:        "send_audio_message",
+			Description: "Send audio/voice message (converted to Opus .ogg if needed).",
+		}, sendAudioMessageHandler)
+	}
 
 	mcp.AddTool[downloadMediaInput, map[string]any](server, &mcp.Tool{
 		Name:        "download_media",
@@ -98,12 +134,22 @@ func InitMcpTool() {
 	ctx := context.Background()
 
 	if isHttp {
-		addr := ReadEnv("HTTP_BASE_URL", "0.0.0.0:5777")
-		slog.Info("Starting WhatsApp MCP HTTP streaming", "addr", addr)
+		addr := ReadEnv("HTTP_BASE_URL", "127.0.0.1:5777")
+		token := ReadEnv("MCP_AUTH_TOKEN", "")
+		if token == "" && !isLoopbackAddr(addr) {
+			log.Fatalf("refusing to serve MCP on %s without MCP_AUTH_TOKEN; set a token (openssl rand -base64 48) or bind to 127.0.0.1", addr)
+		}
+		if token != "" && len(token) < 32 {
+			log.Fatalf("MCP_AUTH_TOKEN is too short (need at least 32 characters)")
+		}
+		slog.Info("Starting WhatsApp MCP HTTP streaming", "addr", addr, "auth", token != "")
 
-		handler := mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
+		var handler http.Handler = mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
 			return server
 		}, nil)
+		if token != "" {
+			handler = bearerAuth(token, handler)
+		}
 		if err := http.ListenAndServe(addr, handler); err != nil {
 			log.Fatalf("Server failed: %v", err)
 		}
@@ -120,10 +166,10 @@ type searchContactsInput struct {
 }
 
 type listMessagesInput struct {
-	After             *string `mcp:"description:ISO-8601 formatted string"`
+	After             *string `json:"after,omitempty" jsonschema:"description:ISO-8601 formatted string"`
 	Before            *string `json:"before,omitempty" jsonschema:"description:ISO-8601 formatted string"`
 	SenderPhoneNumber *string `json:"sender_phone_number,omitempty"`
-	ChatJid           *string `json:"chat_jid,omitempty"`
+	ChatJid           *string `json:"chat_jid,omitempty" jsonschema:"description:Chat JID (e.g. 123@g.us) or the exact chat name"`
 	Query             *string `json:"query,omitempty" jsonschema:"description:Search term in message content"`
 	Limit             int     `json:"limit" jsonschema:"default:20"`
 	Page              int     `json:"page" jsonschema:"default:0"`
@@ -292,7 +338,7 @@ func searchContactsHandler(
 		return ErrResult("query is required"), nil, nil
 	}
 
-	data, err := callAPI(http.MethodGet, "/contacts/search?q="+in.Query, nil)
+	data, err := callAPI(http.MethodGet, "/contacts/search?q="+url.QueryEscape(in.Query), nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}
@@ -313,28 +359,29 @@ func listMessagesHandler(
 	req *mcp.CallToolRequest,
 	in listMessagesInput,
 ) (*mcp.CallToolResult, any, error) {
-	q := ""
+	v := url.Values{}
 	if in.After != nil {
-		q += "&after=" + *in.After
+		v.Set("after", *in.After)
 	}
 	if in.Before != nil {
-		q += "&before=" + *in.Before
+		v.Set("before", *in.Before)
 	}
 	if in.SenderPhoneNumber != nil {
-		q += "&sender=" + *in.SenderPhoneNumber
+		v.Set("sender", *in.SenderPhoneNumber)
 	}
 	if in.ChatJid != nil {
-		q += "&chat=" + *in.ChatJid
+		v.Set("chat", *in.ChatJid)
 	}
 	if in.Query != nil {
-		q += "&search=" + *in.Query
+		v.Set("search", *in.Query)
 	}
-	q += fmt.Sprintf("&limit=%d&page=%d", in.Limit, in.Page)
+	v.Set("limit", strconv.Itoa(in.Limit))
+	v.Set("page", strconv.Itoa(in.Page))
 	if in.IncludeContext {
-		q += "&context=true"
+		v.Set("context", "true")
 	}
 
-	data, err := callAPI(http.MethodGet, "/messages?"+strings.TrimPrefix(q, "&"), nil)
+	data, err := callAPI(http.MethodGet, "/messages?"+v.Encode(), nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}
@@ -377,7 +424,7 @@ func getMessageContextHandler(
 	}
 
 	path := fmt.Sprintf("/messages/context/%s?before=%d&after=%d",
-		in.MessageID, in.Before, in.After)
+		url.PathEscape(in.MessageID), in.Before, in.After)
 
 	data, err := callAPI(http.MethodGet, path, nil)
 	if err != nil {
@@ -397,15 +444,17 @@ func listChatsHandler(
 	req *mcp.CallToolRequest,
 	in listChatsInput,
 ) (*mcp.CallToolResult, any, error) {
-	q := fmt.Sprintf("?limit=%d&page=%d", in.Limit, in.Page)
+	v := url.Values{}
+	v.Set("limit", strconv.Itoa(in.Limit))
+	v.Set("page", strconv.Itoa(in.Page))
 	if in.Query != nil && *in.Query != "" {
-		q += "&q=" + *in.Query
+		v.Set("q", *in.Query)
 	}
 	if in.SortBy != "" {
-		q += "&sort=" + in.SortBy
+		v.Set("sort", in.SortBy)
 	}
 
-	data, err := callAPI(http.MethodGet, "/chats"+q, nil)
+	data, err := callAPI(http.MethodGet, "/chats?"+v.Encode(), nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}
@@ -428,7 +477,7 @@ func getChatHandler(
 		return ErrResult("chat_jid is required"), nil, nil
 	}
 
-	data, err := callAPI(http.MethodGet, "/chats/"+in.ChatJid, nil)
+	data, err := callAPI(http.MethodGet, "/chats/"+url.PathEscape(in.ChatJid), nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}
@@ -451,7 +500,7 @@ func getDirectChatByContactHandler(
 	}
 
 	// GET /api/direct-contacts/{phone}/chat
-	path := fmt.Sprintf("/direct-contacts/%s/chat", in.SenderPhoneNumber)
+	path := fmt.Sprintf("/direct-contacts/%s/chat", url.PathEscape(in.SenderPhoneNumber))
 
 	data, err := callAPI(http.MethodGet, path, nil)
 	if err != nil {
@@ -498,7 +547,7 @@ func getContactChatsHandler(
 	}
 
 	// GET /api/contacts/{jid}/chats?limit=...&page=...
-	path := fmt.Sprintf("/contacts/%s/chats?limit=%d&page=%d", in.Jid, limit, page)
+	path := fmt.Sprintf("/contacts/%s/chats?limit=%d&page=%d", url.PathEscape(in.Jid), limit, page)
 
 	data, err := callAPI(http.MethodGet, path, nil)
 	if err != nil {
@@ -513,7 +562,7 @@ func getContactChatsHandler(
 		return ErrResult("failed to parse chats response"), nil, nil
 	}
 
-	return &mcp.CallToolResult{}, result.Chats, nil
+	return OkResult(map[string]any{"chats": result.Chats, "count": result.Count}), nil, nil
 }
 
 func getLastInteractionHandler(
@@ -526,7 +575,7 @@ func getLastInteractionHandler(
 	}
 
 	// We simulate it by asking for 1 message from that sender
-	data, err := callAPI(http.MethodGet, "/messages?sender="+in.Jid+"&limit=1", nil)
+	data, err := callAPI(http.MethodGet, "/messages?"+url.Values{"sender": {in.Jid}, "limit": {"1"}}.Encode(), nil)
 	if err != nil {
 		return ErrResult(err.Error()), nil, nil
 	}

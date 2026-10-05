@@ -105,6 +105,10 @@ type Message struct {
 
 type MessageStore struct {
 	db *sql.DB
+	// contactsDB holds whatsmeow's own tables (whatsmeow_contacts etc.).
+	// With Postgres it is the same database as db; with SQLite whatsmeow
+	// keeps them in a separate file, store/whatsapp.db, opened read-only.
+	contactsDB *sql.DB
 }
 
 var isPostgres = false
@@ -167,6 +171,31 @@ func validateMediaPath(mediaPath string) (string, error) {
 	return absPath, nil
 }
 
+// safeFilename strips any directory components from a sender-supplied
+// filename so it can't escape the chat's media directory.
+func safeFilename(name string) string {
+	name = strings.ReplaceAll(name, "\\", "/") // treat Windows separators as separators too
+	name = filepath.Base(name)
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, name)
+	if name == "" || name == "." || name == ".." || name == "/" {
+		name = "file_" + time.Now().Format("20060102_150405")
+	}
+	return name
+}
+
+// openContactsDB returns the database that holds whatsmeow's tables.
+func openContactsDB(db *sql.DB) (*sql.DB, error) {
+	if isPostgres {
+		return db, nil
+	}
+	return sql.Open("sqlite3", "file:store/whatsapp.db?mode=ro&_busy_timeout=5000")
+}
+
 // NewMessageStore Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	if err := os.MkdirAll("store", 0755); err != nil {
@@ -217,11 +246,19 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	return &MessageStore{db: db}, nil
+	contactsDB, err := openContactsDB(db)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open contacts database: %v", err)
+	}
+
+	return &MessageStore{db: db, contactsDB: contactsDB}, nil
 }
 
 // Close the database connection
 func (store *MessageStore) Close() error {
+	if store.contactsDB != nil && store.contactsDB != store.db {
+		_ = store.contactsDB.Close()
+	}
 	return store.db.Close()
 }
 
@@ -608,7 +645,7 @@ func CustomGetLatestVersion(ctx context.Context, httpClient *http.Client) (*stor
 	if err != nil {
 		return nil, fmt.Errorf("failed to prepare request: %w", err)
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:157.0) Gecko/20100101 Firefox/157.0")
 	req.Header.Set("Sec-Fetch-Dest", "document")
 	req.Header.Set("Sec-Fetch-Mode", "navigate")
 	req.Header.Set("Sec-Fetch-Site", "none")
@@ -638,6 +675,45 @@ func CustomGetLatestVersion(ctx context.Context, httpClient *http.Client) (*stor
 }
 
 // Function to send a WhatsApp message
+// readOnly reports whether the bridge refuses all sends. Read-only is the
+// default; only an explicit READ_ONLY=false (or 0/no) enables /send.
+func readOnly() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("READ_ONLY"))) {
+	case "false", "0", "no":
+		return false
+	}
+	return true
+}
+
+var (
+	sendAllowlistOnce sync.Once
+	sendAllowlist     map[string]bool // nil means no allowlist configured
+)
+
+// recipientAllowed enforces SEND_ALLOWLIST, a comma-separated list of phone
+// numbers (digits only, e.g. 61412345678) and/or full JIDs (e.g.
+// 12036302xxxx@g.us). When unset, every recipient is allowed.
+func recipientAllowed(jid types.JID) bool {
+	sendAllowlistOnce.Do(func() {
+		raw := strings.TrimSpace(os.Getenv("SEND_ALLOWLIST"))
+		if raw == "" {
+			return
+		}
+		sendAllowlist = map[string]bool{}
+		for _, e := range strings.Split(raw, ",") {
+			e = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(e), "+"))
+			if e != "" {
+				sendAllowlist[e] = true
+			}
+		}
+		slog.Info("SEND_ALLOWLIST enabled", "entries", len(sendAllowlist))
+	})
+	if sendAllowlist == nil {
+		return true
+	}
+	return sendAllowlist[jid.String()] || (jid.Server == types.DefaultUserServer && sendAllowlist[jid.User])
+}
+
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
@@ -658,6 +734,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			User:   recipient,
 			Server: "s.whatsapp.net", // For personal chats
 		}
+	}
+
+	if !recipientAllowed(recipientJID) {
+		slog.Warn("send blocked: recipient not in SEND_ALLOWLIST", "recipient", recipientJID.String())
+		return false, "Recipient is not in SEND_ALLOWLIST"
 	}
 
 	msg := &waE2E.Message{}
@@ -815,7 +896,7 @@ func extractMediaInfo(msg *waE2E.Message) (mediaType string, filename string, ur
 	}
 
 	if doc := msg.GetDocumentMessage(); doc != nil {
-		filename := doc.GetFileName()
+		filename := safeFilename(doc.GetFileName())
 		if filename == "" {
 			filename = "document_" + time.Now().Format("20060102_150405")
 		}
@@ -827,6 +908,21 @@ func extractMediaInfo(msg *waE2E.Message) (mediaType string, filename string, ur
 }
 
 // Handle regular incoming messages with media support
+var (
+	webhookClient  = &http.Client{Timeout: 10 * time.Second}
+	webhookURLOnce sync.Once
+	webhookURLVal  string
+)
+
+func getWebhookURL() string {
+	webhookURLOnce.Do(func() {
+		if cfg, err := config.LoadConfig(); err == nil {
+			webhookURLVal = cfg.WebhookUrl
+		}
+	})
+	return webhookURLVal
+}
+
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	chatJID := normalizeUserJID(client, msg.Info.Chat).String()
 	sender := normalizeUserJID(client, msg.Info.Sender).User
@@ -873,13 +969,15 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 
 	if mediaType != "" {
-		slog.Info("message", "ts", timestamp, "direction", direction, "sender", sender, "media_type", mediaType, "filename", filename, "content", content)
+		slog.Info("message", "ts", timestamp, "direction", direction, "sender", sender, "media_type", mediaType)
+		slog.Debug("message body", "filename", filename, "content", content)
 	} else if content != "" {
-		slog.Info("message", "ts", timestamp, "direction", direction, "sender", sender, "content", content)
+		slog.Info("message", "ts", timestamp, "direction", direction, "sender", sender)
+		slog.Debug("message body", "content", content)
 	}
 	go func(msgID string, chat string) {
-		cfg, err := config.LoadConfig()
-		if err != nil || cfg.WebhookUrl == "" {
+		webhookURL := getWebhookURL()
+		if webhookURL == "" {
 			return
 		}
 
@@ -898,7 +996,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 		jsonData, _ := json.Marshal(payload)
 
-		resp, err := http.Post(cfg.WebhookUrl, "application/json", bytes.NewBuffer(jsonData))
+		resp, err := webhookClient.Post(webhookURL, "application/json", bytes.NewBuffer(jsonData))
 		if err != nil {
 			log.Println("Webhook POST error:", err)
 			return
@@ -1057,11 +1155,16 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	filename = safeFilename(filename)
+	localPath = filepath.Join(chatDir, filename)
 
 	absPath, err := filepath.Abs(localPath)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
+	}
+	absChatDir, err := filepath.Abs(chatDir)
+	if err != nil || !strings.HasPrefix(absPath, absChatDir+string(os.PathSeparator)) {
+		return false, "", "", "", fmt.Errorf("refusing to write media outside %s", chatDir)
 	}
 
 	if _, err := os.Stat(localPath); err == nil {
@@ -1139,6 +1242,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		if readOnly() {
+			slog.Warn("send blocked: READ_ONLY is enabled")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: "Sending is disabled (READ_ONLY=true)"})
+			return
+		}
 
 		var req SendMessageRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1156,7 +1266,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 			return
 		}
 
-		slog.Info("received request to send message", "message", req.Message, "media_path", req.MediaPath)
+		slog.Info("received request to send message", "recipient", req.Recipient, "has_media", req.MediaPath != "")
+		slog.Debug("send request body", "message", req.Message, "media_path", req.MediaPath)
 
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
 		slog.Info("message sent", "success", success, "message", message)
@@ -1506,7 +1617,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 	http.Handle("/auth/login", auth.LoginHandler(cfg))
 
 	serverAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	slog.Info("starting REST API server", "addr", serverAddr)
+	slog.Info("starting REST API server", "addr", serverAddr, "read_only", readOnly())
 
 	go func() {
 		if err := http.ListenAndServe(serverAddr, nil); err != nil {
@@ -1956,7 +2067,7 @@ func (store *MessageStore) FormatMessage(msg MessageInteraction, showChatInfo bo
 	ts := msg.Timestamp.Format("2006-01-02 15:04:05")
 
 	if showChatInfo && msg.ChatName != "" {
-		sb.WriteString(fmt.Sprintf("[%s] Chat: %s ", ts, msg.ChatName))
+		sb.WriteString(fmt.Sprintf("[%s] Chat: %s (%s) ", ts, msg.ChatName, msg.ChatJID))
 	} else {
 		sb.WriteString(fmt.Sprintf("[%s] ", ts))
 	}
@@ -1984,6 +2095,39 @@ func (store *MessageStore) FormatMessagesList(messages []MessageInteraction, sho
 		sb.WriteString(store.FormatMessage(m, showChatInfo))
 	}
 	return sb.String()
+}
+
+// resolveChatJID accepts either a chat JID or a chat name. Anything
+// containing "@" is treated as a JID; otherwise it must match exactly one
+// chat name (case-insensitive).
+func (store *MessageStore) resolveChatJID(chat string) (string, error) {
+	if strings.Contains(chat, "@") {
+		return chat, nil
+	}
+	q := "SELECT jid FROM chats WHERE LOWER(name) = LOWER(?) LIMIT 2"
+	if isPostgres {
+		q = "SELECT jid FROM chats WHERE LOWER(name) = LOWER($1) LIMIT 2"
+	}
+	rows, err := store.db.Query(q, chat)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var jids []string
+	for rows.Next() {
+		var jid string
+		if err := rows.Scan(&jid); err == nil {
+			jids = append(jids, jid)
+		}
+	}
+	switch len(jids) {
+	case 0:
+		return "", fmt.Errorf("no chat named %q; use list_chats to find its JID", chat)
+	case 1:
+		return jids[0], nil
+	default:
+		return "", fmt.Errorf("more than one chat is named %q; use list_chats and pass the JID", chat)
+	}
 }
 
 func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
@@ -2029,8 +2173,12 @@ func (store *MessageStore) ListMessages(s ListMessagesParams) (string, error) {
 	}
 
 	if s.ChatJid != nil && *s.ChatJid != "" {
+		chatJID, err := store.resolveChatJID(*s.ChatJid)
+		if err != nil {
+			return "", err
+		}
 		where = append(where, "m.chat_jid = "+placeholder(len(args)+1))
-		args = append(args, *s.ChatJid)
+		args = append(args, chatJID)
 	}
 
 	if s.Query != nil && *s.Query != "" {
@@ -2321,10 +2469,14 @@ func (store *MessageStore) ListChats(
 	}
 	q += " ORDER BY " + order
 
-	q += " LIMIT " + placeholder(len(args)+1) + "::int"
+	intCast := ""
+	if isPostgres {
+		intCast = "::int"
+	}
+	q += " LIMIT " + placeholder(len(args)+1) + intCast
 	args = append(args, limit)
 
-	q += " OFFSET " + placeholder(len(args)+1) + "::int"
+	q += " OFFSET " + placeholder(len(args)+1) + intCast
 	args = append(args, page*limit)
 
 	rows, err := store.db.Query(q, args...)
@@ -2381,19 +2533,23 @@ func (store *MessageStore) SearchContacts(query string) ([]Contact, error) {
 		return "?"
 	}
 
+	// Prefer the name saved in the address book, then the contact's own
+	// WhatsApp name, then a business name.
+	nameExpr := `COALESCE(NULLIF(full_name, ''), NULLIF(first_name, ''), NULLIF(push_name, ''), NULLIF(business_name, ''))`
 	q := `
-        SELECT DISTINCT their_jid, first_name
+        SELECT their_jid, MAX(` + nameExpr + `) AS name
         FROM whatsmeow_contacts
-        WHERE (LOWER(first_name) LIKE LOWER(` + placeholder(1) + `)
+        WHERE (LOWER(` + nameExpr + `) LIKE LOWER(` + placeholder(1) + `)
            OR LOWER(their_jid) LIKE LOWER(` + placeholder(2) + `))
           AND their_jid NOT LIKE '%@g.us'
-        ORDER BY first_name, their_jid
+        GROUP BY their_jid
+        ORDER BY name, their_jid
         LIMIT 50
     `
 
 	args := []any{"%" + query + "%", "%" + query + "%"}
 
-	rows, err := store.db.Query(q, args...)
+	rows, err := store.contactsDB.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}

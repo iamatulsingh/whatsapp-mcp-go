@@ -73,6 +73,13 @@ Start `whatsapp-bridge` -> then run `whatsapp-mcp-server` in your preferred mode
        }
       ```
 
+      > **Read-only by default.** The bridge refuses sends and the MCP server hides the
+      > send tools unless `READ_ONLY=false`. The bridge and MCP server are separate
+      > processes, so to enable sending you must set `READ_ONLY=false` in **both**: in the
+      > bridge's environment (e.g. `whatsapp-bridge/.env` or `READ_ONLY=false go run main.go`)
+      > and in the `env` block above (`"READ_ONLY": "false"`). Setting it in only one leaves
+      > sending disabled: either the tools stay hidden, or `/api/send` returns 403.
+
       For **Claude**, save this as `claude_desktop_config.json` in your Claude Desktop configuration directory at:
 
       ```
@@ -200,12 +207,15 @@ Claude can access the following tools to interact with WhatsApp:
 - **get_contact_chats**: List all chats involving a specific contact
 - **get_last_interaction**: Get the most recent message with a contact
 - **get_message_context**: Retrieve context around a specific message
-- **send_message**: Send a WhatsApp message to a specified phone number or group JID
-- **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
-- **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
 - **get_login_status**: Check whether the bridge is connected and logged in to WhatsApp. Returns `{connected, logged_in, pairing_required}`.
 - **get_pairing_qr**: Fetch the WhatsApp pairing QR as a PNG image. Returns image content when pairing is required, or a text message when the bridge is already logged in. Useful for completing the initial device-link flow from inside an MCP-aware UI instead of from the terminal.
+
+Send tools, available only when `READ_ONLY=false` is set for **both** the bridge and the MCP server (see step 3 above):
+
+- **send_message**: Send a WhatsApp message to a specified phone number or group JID
+- **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
+- **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 
 ### Media Handling Features
 
@@ -317,4 +327,3 @@ Choose this version if you want:
 - a more maintainable and extensible project  
 
 The goal is not to replace the original project but to offer an alternative that fits different needs — especially for developers who prefer Go or want to deploy MCP‑based WhatsApp automation in production environments.
-

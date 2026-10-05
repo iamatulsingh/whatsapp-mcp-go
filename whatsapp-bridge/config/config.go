@@ -66,6 +66,11 @@ func LoadConfig() (*Config, error) {
 	webhookUrl := os.Getenv("WEBHOOK_URL")
 
 	serverHost := os.Getenv("HOST")
+	if serverHost == "" {
+		// Default to loopback. Set HOST=0.0.0.0 explicitly (e.g. in Docker)
+		// to listen on all interfaces.
+		serverHost = "127.0.0.1"
+	}
 	serverPort := 8080
 	if v, ok := os.LookupEnv("PORT"); ok {
 		p, err := strconv.Atoi(v)

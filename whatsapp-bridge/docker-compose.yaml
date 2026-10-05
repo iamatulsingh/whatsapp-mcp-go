@@ -7,8 +7,7 @@ services:
       POSTGRES_USER: "${POSTGRES_USER:?set POSTGRES_USER in environment or .env}"
       POSTGRES_PASSWORD: "${POSTGRES_PASS:?set POSTGRES_PASS in environment or .env}"
       POSTGRES_DB: whatsapp
-    ports:
-      - "5432:5432"
+    # No published port: only wa-bridge needs the database, over the compose network.
     volumes:
       - pgdata:/var/lib/postgresql/data
 
@@ -29,10 +28,14 @@ services:
       LOG_LEVEL: "${LOG_LEVEL:-info}"
       AUTH_LOGIN_RATE: "${AUTH_LOGIN_RATE:-}"
       WEBHOOK_URL: "${WEBHOOK_URL:-}"
-      HOST: "${HOST:-}"
+      SEND_ALLOWLIST: "${SEND_ALLOWLIST:-}"
+      READ_ONLY: "${READ_ONLY:-true}"
+      # Listen on all interfaces inside the container so wa-mcp can reach it;
+      # the published port below is bound to the host's loopback only.
+      HOST: "0.0.0.0"
       PORT: "${PORT:-8080}"
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - bridge-store:/project/store
     depends_on:
@@ -57,9 +60,11 @@ services:
       API_BASE_URL: "http://wa-bridge:8080/api"
       IS_HTTP: "true"
       HTTP_BASE_URL: "0.0.0.0:5777"
+      READ_ONLY: "${READ_ONLY:-true}"
+      MCP_AUTH_TOKEN: "${MCP_AUTH_TOKEN:?set MCP_AUTH_TOKEN in environment or .env}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
     ports:
-      - "5777:5777"
+      - "127.0.0.1:5777:5777"
     depends_on:
       - wa-bridge
     deploy:
